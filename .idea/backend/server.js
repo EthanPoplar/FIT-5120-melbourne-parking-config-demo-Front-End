@@ -1,6 +1,7 @@
 // server.js — Real-time parking (City of Melbourne Opendatasoft) + basic historical stats
 // Run: npm i && node server.js
 // Env (.env): see .env.sample
+require('dotenv').config();
 const { aggregateSensorsToAreas, rankAreas } = require('./lib/areas');
 const { haversineMeters } = require('./lib/geo');
 const express = require('express');

@@ -5,6 +5,9 @@ const BASE = process.env.OPEN_DATA_BASE || 'https://data.melbourne.vic.gov.au';
 const LIVE_DATASET_ID = process.env.LIVE_DATASET_ID || 'on-street-parking-bay-sensors';
 const EVENTS_DATASET_ID = process.env.EVENTS_DATASET_ID || '';
 
+if (process.env.ODS_API_KEY) {
+    axios.defaults.headers.common['Authorization'] = `Apikey ${process.env.ODS_API_KEY}`;
+}
 function buildUrl(datasetId, params = {}) {
     const url = new URL(`${BASE}/api/explore/v2.1/catalog/datasets/${encodeURIComponent(datasetId)}/records`);
     for (const [k, v] of Object.entries(params)) {

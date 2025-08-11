@@ -14,6 +14,11 @@ async function loadConfig() {
 const CONFIG = await loadConfig();
 const USE_MOCK = CONFIG.useMock;
 const API_BASE = CONFIG.apiBase;
+// Ensure `api` exists early to avoid TDZ when referenced below
+if (typeof window !== 'undefined') {
+  window.api = window.api || {};
+}
+var api = (typeof window !== 'undefined') ? (window.api = window.api || {}) : (globalThis.api = (globalThis.api || {}));
 console.log('Config loaded:', CONFIG);
 // Ensure a favicon exists to avoid 404 noise in dev
 (function ensureFavicon(){
@@ -721,6 +726,64 @@ async function renderCharts(lots) {
     options: { responsive: true, plugins: { legend: { display: false } } }
   });
 }
+// Map backend contract (available) → frontend shape (available_spots)
+function mapBackendParking(p) {
+  return {
+    id: p.id,
+    name: p.name,
+    lat: p.lat,
+    lng: p.lng,
+    capacity: p.capacity,
+    available_spots: (typeof p.available_spots === 'number') ? p.available_spots : (p.available ?? 0),
+    price: p.price,
+    updated_at: p.updated_at || new Date().toISOString()
+  };
+}
+
+Object.assign(api, {
+  async areasNear(lat, lng, radius = 1200, res = 9, limit = 20, sort = 'mix') {
+    const url = `${API_BASE}/parking/areas?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}&radius=${encodeURIComponent(radius)}&res=${encodeURIComponent(res)}&limit=${encodeURIComponent(limit)}&sort=${encodeURIComponent(sort)}`;
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) {
+        console.warn('areasNear failed:', r.status, r.statusText);
+        renderCharts ;     return { items: [] };
+      }
+      let arr = [];
+      try { arr = await r.json(); } catch (parseErr) { console.warn('areasNear JSON parse failed:', parseErr); }
+      return { items: Array.isArray(arr) ? arr : [] };
+    } catch (err) {
+      console.warn('areasNear network error:', err);
+      return { items: [] };
+    }
+  },
+  async areaDetail(areaId, lat, lng, radius = 1200) {
+    const url = `${API_BASE}/parking/areas/${encodeURIComponent(areaId)}?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}&radius=${encodeURIComponent(radius)}`;
+    const r = await fetch(url, { cache: 'no-store' });
+    return r.json();
+  },
+
+  async geoSearch(q) {
+    if (USE_MOCK) return mock.geoSearch(q);
+    // If no real geo endpoint yet, fall back to mock suggestions (non-blocking)
+    try {
+      const r = await fetch(`${API_BASE}/geo/search?q=${encodeURIComponent(q)}`);
+      if (r.ok) return r.json();
+    } catch (_) {}
+    return mock.geoSearch(q);
+  },
+  async parkingNear(lat, lng, radius) {
+    // Real backend doesn't support lat/lng in this iteration; only use mock for this path
+    if (USE_MOCK) return mock.parkingNear(lat, lng, radius);
+    return { items: [] };
+  },
+  async parkingByDest(dest) {
+    const r = await fetch(`${API_BASE}/parking?dest=${encodeURIComponent(dest)}`, { cache: 'no-store' });
+    const arr = await r.json();              // backend returns an array
+    return { items: arr.map(mapBackendParking) }; // normalize to frontend shape
+  },
+  __mockPushUpdates(ids) { return mock.pushUpdates(ids); }
+});
 // ===================== Melbourne Insights =====================
 let carOwnershipChartRef, cbdPopulationChartRef;
 
@@ -898,65 +961,7 @@ async function initInsights() {
     await refreshCar();
     await refreshCBD();
 }
-// ===================== /Melbourne Insights =====================
-// Map backend contract (available) → frontend shape (available_spots)
-function mapBackendParking(p) {
-  return {
-    id: p.id,
-    name: p.name,
-    lat: p.lat,
-    lng: p.lng,
-    capacity: p.capacity,
-    available_spots: (typeof p.available_spots === 'number') ? p.available_spots : (p.available ?? 0),
-    price: p.price,
-    updated_at: p.updated_at || new Date().toISOString()
-  };
-}
 
-const api = {
-    async areasNear(lat, lng, radius = 1200, res = 9, limit = 20, sort = 'mix') {
-        const url = `${API_BASE}/parking/areas?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}&radius=${encodeURIComponent(radius)}&res=${encodeURIComponent(res)}&limit=${encodeURIComponent(limit)}&sort=${encodeURIComponent(sort)}`;
-        try {
-            const r = await fetch(url, { cache: 'no-store' });
-            if (!r.ok) {
-                console.warn('areasNear failed:', r.status, r.statusText);
-                renderCharts ;     return { items: [] };
-            }
-            let arr = [];
-            try { arr = await r.json(); } catch (parseErr) { console.warn('areasNear JSON parse failed:', parseErr); }
-            return { items: Array.isArray(arr) ? arr : [] };
-        } catch (err) {
-            console.warn('areasNear network error:', err);
-            return { items: [] };
-        }
-    },
-    async areaDetail(areaId, lat, lng, radius = 1200) {
-        const url = `${API_BASE}/parking/areas/${encodeURIComponent(areaId)}?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}&radius=${encodeURIComponent(radius)}`;
-        const r = await fetch(url, { cache: 'no-store' });
-        return r.json();
-    },
-
-    async geoSearch(q) {
-    if (USE_MOCK) return mock.geoSearch(q);
-    // If no real geo endpoint yet, fall back to mock suggestions (non-blocking)
-    try {
-      const r = await fetch(`${API_BASE}/geo/search?q=${encodeURIComponent(q)}`);
-      if (r.ok) return r.json();
-    } catch (_) {}
-    return mock.geoSearch(q);
-  },
-  async parkingNear(lat, lng, radius) {
-    // Real backend doesn't support lat/lng in this iteration; only use mock for this path
-    if (USE_MOCK) return mock.parkingNear(lat, lng, radius);
-    return { items: [] };
-  },
-  async parkingByDest(dest) {
-    const r = await fetch(`${API_BASE}/parking?dest=${encodeURIComponent(dest)}`, { cache: 'no-store' });
-    const arr = await r.json();              // backend returns an array
-    return { items: arr.map(mapBackendParking) }; // normalize to frontend shape
-  },
-  __mockPushUpdates(ids) { return mock.pushUpdates(ids); }
-};
 
 const mock = (() => {
   const places = [
