@@ -73,22 +73,32 @@
     </section>
 
     <!-- Insights -->
-    <section id="insights" class="card insights">
-      <h3 class="section-title">Melbourne Insights</h3>
-      <div class="charts">
-        <div class="chart">
-          <h4 class="chart-title">Average Occupancy by Car Park</h4>
-          <canvas id="avgOccChart" height="140"></canvas>
-        </div>
-        <div class="chart">
-          <h4 class="chart-title">Busiest Hours (Today)</h4>
-          <canvas id="busyHoursChart" height="140"></canvas>
-        </div>
-      </div>
-      <p class="muted small">
-        These use mock data now. When your backend is ready, wire them to <code>/api/v1/stats/parking</code>.
-      </p>
-    </section>
+      <section id="insights" class="panel" style="margin-top:16px;">
+          <h3>Melbourne Insights</h3>
+
+          <div id="carOwnershipCard" class="card" style="margin:12px 0;">
+              <h4>Car ownership by region</h4>
+              <div class="controls" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0;">
+                  <label>Year
+                      <select id="carYear"></select>
+                  </label>
+                  <label>Region
+                      <select id="carRegion"></select>
+                  </label>
+              </div>
+              <canvas id="carOwnershipChart" height="200"></canvas>
+          </div>
+
+          <div id="cbdPopulationCard" class="card" style="margin:12px 0;">
+              <h4>CBD population</h4>
+              <div class="controls" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0;">
+                  <label>Year
+                      <select id="cbdYear"></select>
+                  </label>
+              </div>
+              <canvas id="cbdPopulationChart" height="200"></canvas>
+          </div>
+      </section>
   </main>
 
   <footer class="site-footer">
