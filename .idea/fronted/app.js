@@ -1111,3 +1111,312 @@ function updateDistancesFrom(origin){
     }
   });
 })();
+
+
+
+
+// Jiazhen On Environment Impact
+// === Environment Compare (free stack: Nominatim + OSRM) ===
+(function EnvCompare(){
+  const envIntro = document.getElementById('envIntro');
+  const envGrid  = document.getElementById('envSuggestions');
+  const btnLoc   = document.getElementById('useMyLocation');
+  const btnGo    = document.getElementById('computeBtn');
+  const destEl   = document.getElementById('destText');
+  const originEl = document.getElementById('originStatus');
+  const cbdOnlyEl= document.getElementById('cbdOnly');
+  const envDistance = document.getElementById('envDistance');
+
+
+  if (!btnLoc || !btnGo || !envIntro || !envGrid || !destEl) return;
+
+  // State
+  const F = { car:0.192, bus:0.105, tram:0.041, train:0.036, cycling:0, walking:0 }; // kg CO2/km
+  const state = { origin: null, pickedDest: null };
+
+  // Helpers
+  const CBD = { lat: -37.8136, lon: 144.9631 }; // Melbourne CBD roughly at Swanston/Collins
+  const MAX_SUG = 6;
+  const km = n => Math.round(n*10)/10;
+  const debounce = (fn, ms=250) => { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
+  const dist2CBD = (lat,lon) => {
+    const dx = lat - CBD.lat, dy = lon - CBD.lon;
+    return dx*dx + dy*dy; // enough for ranking
+  };
+
+  function normalizeQuery(q){
+    let s = (q||'').trim();
+    if (/^boxhill$/i.test(s)) s = 'Box Hill';
+    if (!/\b(australia|victoria|melbourne)\b/i.test(s)) s += ', Victoria, Australia';
+    return s;
+  }
+
+  // Geocode (with Melbourne/AU bias)
+  async function geocodeNominatim(q){
+    const base='https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1';
+    const q1 = normalizeQuery(q);
+    const viewbox='144.40,-37.30,145.70,-38.60'; // lon,lat
+    const tries = [
+      `${base}&countrycodes=au&viewbox=${viewbox}&bounded=1&q=${encodeURIComponent(q1)}`,
+      `${base}&countrycodes=au&q=${encodeURIComponent(q1)}`,
+      `${base}&q=${encodeURIComponent(q1)}`
+    ];
+    for (const url of tries){
+      const r = await fetch(url, { headers:{'Accept-Language':'en'} });
+      if (!r.ok) continue;
+      const arr = await r.json();
+      if (arr && arr.length){
+        const { lat, lon, display_name } = arr[0];
+        return { lat: +lat, lon: +lon, name: display_name };
+      }
+    }
+    throw new Error('No result for destination');
+  }
+
+  async function reverseGeocodeNominatim(lat, lon){
+  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=16&addressdetails=1`;
+  const r = await fetch(url, { headers:{ 'Accept-Language':'en' } });
+  if (!r.ok) throw new Error('Reverse geocoding failed');
+  const j = await r.json();
+  const a = j.address || {};
+  // 取更“像地名”的优先级：大学/学院 > 医院/设施 > 郊区/街区 > 城市
+  const main   = a.university || a.college || a.school || a.hospital || a.amenity || '';
+  const area   = a.suburb || a.neighbourhood || a.city_district || a.town || a.city || '';
+  const post   = a.postcode || '';
+  const label  = [main, area, post].filter(Boolean).join(', ')
+               || (j.display_name ? j.display_name.split(',').slice(0,2).join(', ') : '');
+  return label || `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  }
+
+
+
+
+
+  // OSRM road distance
+  async function osrm(profile, a, b){
+    const u = `https://router.project-osrm.org/route/v1/${profile}/${a.lon},${a.lat};${b.lon},${b.lat}?overview=false&alternatives=false&steps=false`;
+    const r = await fetch(u);
+    if (!r.ok) throw new Error('OSRM routing failed');
+    const j = await r.json();
+    if (!j.routes || !j.routes.length) throw new Error('No route');
+    const r0 = j.routes[0];
+    return { km: r0.distance/1000 };
+  }
+
+  // Cards
+  function renderCards(modes){
+    const car = modes.find(m => m.id==='car');
+    envGrid.innerHTML = modes.map(m=>{
+      const savedPct = car && car.co2_kg>0 ? Math.round((1 - m.co2_kg/car.co2_kg)*100) : 0;
+      const pct = Math.max(0, savedPct); // 防负数
+      return `
+        <article class="env-card">
+          <header style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <h4 style="margin:0;font-size:16px">${m.label}</h4>
+          </header>
+          <div class="env-metric"><span>CO₂</span><strong>${m.co2_kg.toFixed(2)} kg</strong></div>
+          <div class="env-metric"><span>Impact</span><strong>~${pct}% less CO₂ than car</strong></div>
+        </article>`;
+    }).join('');
+  }
+
+
+  // ---- Suggestions (simple UI + CBD-first / CBD-only) ----
+  const sugList = document.createElement('ul');
+  sugList.id = 'destSuggestions';
+  sugList.className = 'suggestions';
+  destEl.insertAdjacentElement('afterend', sugList);
+
+  async function fetchSuggestions(q){
+    const base='https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&dedupe=1';
+    const viewbox='144.40,-37.30,145.70,-38.60'; // Greater Melbourne
+    const q1 = normalizeQuery(q);
+    const url = `${base}&countrycodes=au&viewbox=${viewbox}&bounded=1&limit=20&q=${encodeURIComponent(q1)}`;
+
+    const r = await fetch(url, { headers:{ 'Accept-Language':'en' } });
+    if (!r.ok) return [];
+    const arr = await r.json();
+
+    const cbdOnly = !!cbdOnlyEl?.checked;
+
+    // Keep only roads (highway) and collapse duplicates by road + locality
+    const groups = new Map();
+    for (const a of arr){
+      const addr = a.address || {};
+      const isRoad = a.class === 'highway' || addr.road;
+      if (!isRoad) continue;
+
+      const road = (addr.road || (a.display_name?.split(',')[0]??'')).trim();
+      if (!road) continue;
+
+      const locality = addr.suburb || addr.neighbourhood || addr.city_district || addr.town || addr.city || '';
+      const city = addr.city || addr.town || '';
+      const postcode = addr.postcode || '';
+
+      const lat = +a.lat, lon = +a.lon;
+      const d2 = dist2CBD(lat, lon);
+      const inCBD = (postcode==='3000') || (city==='Melbourne' && d2 < 0.00045); // ~2km window
+
+      if (cbdOnly && !inCBD) continue;
+
+      const context = [
+        inCBD ? 'Melbourne CBD' : (locality || city || 'Melbourne'),
+        inCBD ? '3000' : (postcode || '')
+      ].filter(Boolean).join(', ');
+
+      const key = road.toLowerCase() + '|' + (locality||city).toLowerCase();
+      const cand = {
+        label: road, context, lat, lon,
+        priority: inCBD ? 0 : 1,
+        d2
+      };
+
+      const prev = groups.get(key);
+      if (!prev || cand.priority < prev.priority || (cand.priority===prev.priority && cand.d2 < prev.d2)){
+        groups.set(key, cand);
+      }
+    }
+
+    let items = Array.from(groups.values())
+      .sort((a,b)=> a.priority - b.priority || a.d2 - b.d2 || a.label.localeCompare(b.label));
+
+    // 如果开关太严格导致 0 条，自动回退到 CBD-first（不只限 CBD）
+    if (!items.length && cbdOnly){
+      if (cbdOnlyEl) cbdOnlyEl.checked = false;
+      return fetchSuggestions(q);
+    }
+
+    return items.slice(0, MAX_SUG);
+  }
+
+  function renderSuggestions(items){
+    if (!items.length){ sugList.classList.remove('show'); sugList.innerHTML=''; return; }
+    sugList.innerHTML = items.map(it => `
+      <li data-lat="${it.lat}" data-lon="${it.lon}" data-name="${(it.label + ', ' + it.context).replace(/"/g,'&quot;')}">
+        <div style="font-weight:600">${it.label}</div>
+        <div class="muted" style="font-size:12px">${it.context}</div>
+      </li>
+    `).join('');
+    sugList.classList.add('show');
+  }
+
+  destEl.addEventListener('input', debounce(async ()=>{
+    const q = destEl.value.trim();
+    state.pickedDest = null;
+    if (q.length < 3){ renderSuggestions([]); return; }
+    const items = await fetchSuggestions(q);
+    renderSuggestions(items);
+  }, 250));
+
+  sugList.addEventListener('click', (e)=>{
+    const li = e.target.closest('li');
+    if (!li) return;
+    const lat = +li.dataset.lat, lon = +li.dataset.lon, name = li.dataset.name;
+    state.pickedDest = { lat, lon, name };
+    destEl.value = name;                 // ← 回填“路名 + 区域”
+    destEl.focus();     
+    destEl.setSelectionRange(destEl.value.length, destEl.value.length); // 光标到末尾
+    renderSuggestions([]);
+  });
+
+  document.addEventListener('click', (e)=>{
+    if (!sugList.contains(e.target) && e.target !== destEl) renderSuggestions([]);
+  });
+
+  // ---- Compute ----
+  async function compute(){
+  try{
+    envIntro.textContent = 'Computing…';
+    envGrid.innerHTML = '';
+    if (envDistance) envDistance.style.display = 'none';   // 清空/隐藏距离条
+    if (!state.origin) throw new Error('Please allow location first.');
+
+    const q = (destEl.value||'').trim();
+    if (!q && !state.pickedDest) throw new Error('Please enter a destination.');
+
+    const dest = state.pickedDest || await geocodeNominatim(q);
+
+    let carR, cycR, walkR;
+    try{
+      [carR, cycR, walkR] = await Promise.all([
+        osrm('driving', state.origin, dest),
+        osrm('cycling', state.origin, dest).catch(()=>null),
+        osrm('foot', state.origin, dest).catch(()=>null)
+      ]);
+    }catch(_){}
+
+    const carKm = carR?.km ?? 0;
+    const cyclingKm = cycR?.km ?? carKm;
+    const walkingKm = walkR?.km ?? carKm;
+
+    // Try backend first
+    let modes;
+    try{
+      const r = await fetch('/api/emissions', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          origin: state.origin, destination: dest,
+          distance_km: carKm,
+          distance_km_by_mode: { car:carKm, cycling:cyclingKm, walking:walkingKm }
+        })
+      });
+      if (r.ok){
+        const data = await r.json();
+        const defaults = { car:carKm, cycling:cyclingKm, walking:walkingKm };
+        modes = (data.modes||[]).map(m=>({
+          ...m,
+          distance_km: Number.isFinite(m.distance_km) ? m.distance_km : (defaults[m.id] ?? carKm)
+        }));
+      }
+    }catch(_){}
+
+    // Fallback factors
+    if (!modes || !modes.length){
+      const BASE = { car:carKm, bus:carKm, tram:carKm, train:carKm, cycling:cyclingKm, walking:walkingKm };
+      modes = Object.entries(F).map(([id, f])=>({
+        id, label: id[0].toUpperCase()+id.slice(1),
+        distance_km: BASE[id],
+        co2_kg: (BASE[id] ?? 0) * f
+      })).filter(m => Number.isFinite(m.distance_km)).sort((a,b)=>a.co2_kg - b.co2_kg);
+    }
+
+    renderCards(modes);
+
+    
+    envIntro.textContent = `From your location to "${dest.name}"`;
+    if (envDistance){
+      envDistance.style.display = 'flex';
+      envDistance.innerHTML = `<strong>Distance:</strong> <span>${km(carKm)} km</span> <span class="muted">via road network (OSRM)</span>`;
+    }
+  }catch(e){
+    envIntro.textContent = e.message || 'Something went wrong.';
+    envGrid.innerHTML = '';
+    if (envDistance) envDistance.style.display = 'none';
+  }
+}
+
+  // Location
+  btnLoc.addEventListener('click', ()=>{
+    if (!navigator.geolocation){
+      originEl.textContent = 'Geolocation not supported in this browser.'; return;
+    }
+    originEl.textContent = 'Locating…';
+    navigator.geolocation.getCurrentPosition(
+      async pos => {
+        const lat = pos.coords.latitude;
+        const lon = pos.coords.longitude;
+        state.origin = { lat, lon };
+
+        
+        let nice = '';
+        try { nice = await reverseGeocodeNominatim(lat, lon); } catch(_) {}
+        originEl.textContent = `Your Location: ${nice || `${lat.toFixed(5)}, ${lon.toFixed(5)}`}`;
+        originEl.title = `${lat.toFixed(5)}, ${lon.toFixed(5)}`; // 悬停显示坐标
+      },
+      _  => originEl.textContent = 'Location permission denied or unavailable.',
+      { enableHighAccuracy:true, timeout:10000, maximumAge:60000 }
+    );
+  });
+
+  btnGo.addEventListener('click', compute);
+})();
