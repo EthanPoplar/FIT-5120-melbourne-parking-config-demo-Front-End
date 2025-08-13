@@ -20,6 +20,7 @@ if (typeof window !== 'undefined') {
 }
 var api = (typeof window !== 'undefined') ? (window.api = window.api || {}) : (globalThis.api = (globalThis.api || {}));
 console.log('Config loaded:', CONFIG);
+console.log('%cParking FE Build','color:#fff;background:#007aff;padding:2px 6px;border-radius:4px','no-autoload + 500m radius');
 // Ensure a favicon exists to avoid 404 noise in dev
 (function ensureFavicon(){
     try{
@@ -31,6 +32,8 @@ console.log('Config loaded:', CONFIG);
     } catch(e){}
 })();
 const MAP_DEFAULT = { lat: -37.8136, lng: 144.9631, zoom: 14 };
+const SEARCH_RADIUS_METERS = 500; // show parking only within 500 m after a search
+const FRONTEND_FORECAST_ONLY = true; // if true, do NOT fetch history from backend; forecast purely on the client
 const CAR_CO2_KG_PER_KM = 0.2;
 
 const map = L.map('leaflet').setView([MAP_DEFAULT.lat, MAP_DEFAULT.lng], MAP_DEFAULT.zoom);
@@ -212,6 +215,19 @@ let currentDestination = null;
 const searchBox = document.getElementById('searchBox');
 const suggestionsEl = document.getElementById('suggestions');
 let debounceTimer;
+
+// --- Helper to clear parking UI ---
+function clearParkingUI(message) {
+    try {
+        if (cluster) cluster.clearLayers();
+        if (areasLayer) areasLayer.clearLayers();
+        if (markers) markers.clear();
+        if (lotListEl) lotListEl.innerHTML = '';
+        window.__lastParkingItems = [];
+        window.__lastAreas = [];
+        if (typeof message === 'string' && statusEl) statusEl.textContent = message;
+    } catch (_) {}
+}
 // ---- Area naming: reverse geocode & cache ----
 
 // ===== Naive front-end forecast (no backend dependency) =====
@@ -219,6 +235,29 @@ const areaHistoryCache = new Map();   // area_id -> history.series
 const areaForecastCache = new Map();  // area_id -> [{ts, expected_available, ...}]
 let HAS_AREA_HISTORY_ROUTE = null; // null=unknown, true=supported, false=404 → skip in future
 
+// 注入搜索框错误样式
+(function injectSearchErrorStyle(){
+    const id = 'search-error-style';
+    if (!document.getElementById(id)) {
+        const style = document.createElement('style');
+        style.id = id;
+        style.textContent = `
+      #searchBox.input-error {
+        border: 1px solid #e74c3c !important;
+        box-shadow: 0 0 0 3px rgba(231,76,60,.15);
+      }
+    `;
+        document.head.appendChild(style);
+    }
+})();
+
+function setSearchError(msg){
+    if (statusEl) statusEl.textContent = msg;
+    if (searchBox) searchBox.classList.add('input-error');
+}
+function clearSearchError(){
+    if (searchBox) searchBox.classList.remove('input-error');
+}
 function buildHodFromHistory(series) {
   const buckets = Array.from({length:24}, () => ({sum:0, count:0}));
   if (Array.isArray(series)) {
@@ -247,30 +286,68 @@ function defaultDailyFreeProfile() {
   }
   return a;
 }
-function makeNaiveForecast({ total=60, hours=24, historySeries=null }) {
-  const hod = buildHodFromHistory(historySeries);
-  const fallback = defaultDailyFreeProfile();
-  const mean = hod.map((v, h) => (v===null ? fallback[h] : v));
-  const lo = mean.map(v => Math.max(0, v - 0.1));
-  const hi = mean.map(v => Math.min(1, v + 0.1));
-  const now = new Date();
-  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours()+1));
-  const out = [];
-  for (let i=0; i<hours; i++) {
-    const t = new Date(start.getTime() + i * 3600*1000);
-    const h = t.getUTCHours();
-    const fr = mean[h];
-    out.push({
-      ts: t.toISOString(),
-      expected_available: Math.round(fr * total),
-      lo80: Math.max(0, Math.round(lo[h] * total)),
-      hi80: Math.min(total, Math.round(hi[h] * total)),
-      free_ratio: fr
-    });
+// Extremely simple: random, smoothed, and only capped by total capacity
+function makeNaiveForecast({
+  total = 60,
+  hours = 24,
+  historySeries = null,   // ignored for pure random mode
+  currentAvail = 0,       // used as starting point (optional)
+  dow = (new Date()).getDay(),   // ignored
+  cbdProximity = 1,              // ignored
+  stepMinutes = 60,              // 60 or 30
+  params = {}
+}) {
+  // Tunables for randomness / smoothing
+  const P = Object.assign({
+    meanRatio: 0.45,     // average free ratio center (0..1)
+    volRatio:  0.18,     // volatility as fraction of total capacity
+    smooth:    0.55      // 0..1, higher = smoother (EMA blend with previous)
+  }, params);
+
+  // Helper: bounded random ~ "soft" normal by summing uniforms
+  function randnUnit() {
+    // mean 0.5, variance ~ 1/12; convert to approx N(0,1) by central limit (sum 12 uniforms - 6)
+    let s = 0;
+    for (let i=0; i<12; i++) s += Math.random();
+    return s - 6; // ~N(0,1)
   }
+
+  const now = new Date();
+  const start = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), 0, 0
+  ));
+  const stepMs = Math.max(15, stepMinutes) * 60 * 1000;
+  const firstTs = new Date(start.getTime() + stepMs);
+  const steps = Math.max(1, Math.round((hours * 60) / stepMinutes));
+
+  const out = [];
+  let prev = Math.max(0, Math.min(total, Math.round(currentAvail || Math.round(P.meanRatio * total))));
+
+  for (let i=0; i<steps; i++) {
+    // candidate around mean with noise
+    const center = P.meanRatio * total;
+    const noise  = randnUnit() * (P.volRatio * total);
+    let cand = Math.round(center + noise);
+
+    // blend with previous to make it look less jumpy
+    cand = Math.round(P.smooth * prev + (1 - P.smooth) * cand);
+
+    // hard bounds [0, total]
+    const expected = Math.max(0, Math.min(total, cand));
+
+    out.push({
+      ts: new Date(firstTs.getTime() + i * stepMs).toISOString(),
+      expected_available: expected,
+      free_ratio: total > 0 ? expected / total : 0
+    });
+
+    prev = expected;
+  }
+
   return out;
 }
 async function fetchAreaHistorySeries(areaId, lat, lng, radius=1200) {
+    if (FRONTEND_FORECAST_ONLY) return null;
     if (areaHistoryCache.has(areaId)) return areaHistoryCache.get(areaId);
 
     // 1) Prefer by-coordinate (后端这条是存在的)
@@ -327,7 +404,12 @@ function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 async function reverseGeocodeName(lat, lng){
     const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lng)}&zoom=18&addressdetails=1`;
-    const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    const r = await fetch(url, {
+        headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'FIT-5120-melb-parking/1.0 (contact: your-email@example.com)'
+        }
+    });
     if (!r.ok) return null;
     const j = await r.json();
     const a = j.address || {};
@@ -370,8 +452,9 @@ searchBox.addEventListener('keydown', async (e) => {
     try {
         const items = await combinedSearch(q);
         if (!items.length) {
-            const center = map.getCenter();
-            await chooseDestination({ name: q, lat: center.lat, lng: center.lng });
+            suggestionsEl.style.display = 'none';
+            setSearchError(`No results for "${q}" in Melbourne.`);
+            clearParkingUI('No car parks to show. Try another place.');
             return;
         }
         const first = items[0];
@@ -382,7 +465,7 @@ searchBox.addEventListener('keydown', async (e) => {
             const found = list.find(p => p.id === first.id);
             if (found) showLotPopup(found);
         } else {
-            await chooseDestination(first);
+            await chooseDestination({ ...first, type:'place' });
         }
     } catch (err) {
         console.error('Enter search failed:', err);
@@ -409,14 +492,24 @@ async function combinedSearch(q){
     return [...local, ...remote].slice(0, 8);
 }
 searchBox.addEventListener('input', (e) => {
+  clearSearchError(); // user is changing input, clear previous error
+  clearParkingUI('Type a place name to search…');
   const q = e.target.value.trim();
   clearTimeout(debounceTimer);
   if (!q) { suggestionsEl.style.display = 'none'; return; }
-    debounceTimer = setTimeout(async () => {
-        const items = await combinedSearch(q);
-        renderSuggestions(items);
-    }, 250);
+  debounceTimer = setTimeout(async () => {
+    const items = await combinedSearch(q);
+    if (!items.length) {
+      suggestionsEl.style.display = 'none';
+      setSearchError(`No results for "${q}" in Melbourne.`);
+      clearParkingUI('No car parks to show. Try another place.');
+      return;
+    }
+    clearSearchError();
+    renderSuggestions(items);
+  }, 250);
 });
+
 
 function renderSuggestions(items) {
     suggestionsEl.innerHTML = '';
@@ -427,6 +520,7 @@ function renderSuggestions(items) {
             li.textContent = `🅿︎ ${it.name}`;
             li.tabIndex = 0;
             li.addEventListener('click', () => {
+                clearSearchError();
                 suggestionsEl.style.display = 'none';
                 map.setView([it.lat, it.lng], 17);
                 const list = Array.isArray(window.__lastParkingItems) ? window.__lastParkingItems : [];
@@ -437,8 +531,8 @@ function renderSuggestions(items) {
         } else {
             li.textContent = it.name;
             li.tabIndex = 0;
-            li.addEventListener('click', () => chooseDestination(it));
-            li.addEventListener('keypress', (e) => { if (e.key === 'Enter') chooseDestination(it); });
+            li.addEventListener('click', () => { clearSearchError(); chooseDestination({ ...it, type:'place' }); });
+            li.addEventListener('keypress', (e) => { if (e.key === 'Enter') { clearSearchError(); chooseDestination({ ...it, type:'place' }); } });
         }
         suggestionsEl.appendChild(li);
     }
@@ -446,15 +540,29 @@ function renderSuggestions(items) {
 }
 
 async function chooseDestination(place) {
+    // Guard: only accept structured picks (place/area) with valid coordinates.
+    if (
+        !place ||
+        !(['place','area'].includes(place.type)) ||
+        !Number.isFinite(place.lat) ||
+        !Number.isFinite(place.lng)
+    ) {
+        suggestionsEl.style.display = 'none';
+        setSearchError('Please choose a valid place from the suggestions.');
+        clearParkingUI('No car parks to show. Try another place.');
+        return;
+    }
     suggestionsEl.style.display = 'none';
+    clearSearchError();
     searchBox.value = place.name;
     currentDestination = place;
 
     map.setView([place.lat, place.lng], 16);
     statusEl.textContent = 'Loading nearby parking…';
+    clearParkingUI('Loading nearby parking…');
 
     if (USE_MOCK) {
-        const { items } = await api.parkingNear(place.lat, place.lng, 900);
+        const { items } = await api.parkingNear(place.lat, place.lng, SEARCH_RADIUS_METERS);
         window.__lastParkingItems = items.slice();
         for (const it of items) it.distance_m = distanceMeters({ lat: place.lat, lng: place.lng }, it);
 
@@ -470,9 +578,11 @@ async function chooseDestination(place) {
     }
 
     // 真实后端：用“区域”接口
-    const { items: areas } = await api.areasNear(place.lat, place.lng, 1200, 9, 20, 'mix');
+    const { items: areas } = await api.areasNear(place.lat, place.lng, SEARCH_RADIUS_METERS, 9, 20, 'mix');
     for (const a of areas) a._distance_m = distanceMeters({ lat: place.lat, lng: place.lng }, { lat: a.center.lat, lng: a.center.lng });
     window.__lastAreas = areas.slice();
+    // Enforce 500 m radius on client in case backend ignores `radius`
+    const areasInRange = areas.filter(a => Number.isFinite(a._distance_m) && a._distance_m <= SEARCH_RADIUS_METERS);
 
     // —— 使用聚合后的“停车场”作为 marker 显示 ——
     // 清理旧图层
@@ -481,7 +591,7 @@ async function chooseDestination(place) {
     lotListEl.innerHTML = '';
 
     // 将区域转为“停车场”伪 lot（便于沿用现有 card/marker 组件）
-    const pseudoLots = areas.map((a, i) => ({
+    const pseudoLots = areasInRange.map((a, i) => ({
       id: a.area_id,
       name: `Parking Area ${i+1}`,           // 也可以改成 `Area ${a.area_id.slice(0,6)}`
       lat: a.center.lat,
@@ -507,8 +617,8 @@ async function chooseDestination(place) {
 
     // 状态提示（与截图一致风格）
     statusEl.textContent = pseudoLots.length
-      ? `Showing ${pseudoLots.length} car parks near ${place.name}.`
-      : 'No car parks found here.';
+        ? `Showing ${pseudoLots.length} car parks within ${Math.round(SEARCH_RADIUS_METERS)} m of ${place.name}.`
+        : `No car parks found within ${Math.round(SEARCH_RADIUS_METERS)} m. Try a different place.`;
 
     // 环保与图表直接复用伪 lots
     renderEnvSuggestions(place, pseudoLots);
@@ -521,37 +631,64 @@ async function showLotPopup(p) {
   try {
     // 尝试从后端刷新单点信息（若可用），不影响预测
       // 尝试按“区域”刷新详情；没有也不阻塞
-      try {
-          const r = await fetch(`${API_BASE}/parking/areas/${encodeURIComponent(p.id)}?lat=${encodeURIComponent(p.lat)}&lng=${encodeURIComponent(p.lng)}&radius=1200`, { cache: 'no-store' });
-          if (r.ok) {
-              const detail = await r.json();
-              const fresh = {
-                  id: p.id,
-                  name: (window.areaNameCache && areaNameCache.get(p.id)) || p.name,
-                  lat: p.lat,
-                  lng: p.lng,
-                  capacity: Number(detail.total_bays ?? p.capacity ?? 0),
-                  available_spots: Number(detail.available_bays ?? p.available_spots ?? 0),
-                  updated_at: detail.updated_at || p.updated_at
-              };
-              p = { ...p, ...fresh };
-          }
-      } catch (_) {}
+      if (!FRONTEND_FORECAST_ONLY) {
+        try {
+            const r = await fetch(`${API_BASE}/parking/areas/${encodeURIComponent(p.id)}?lat=${encodeURIComponent(p.lat)}&lng=${encodeURIComponent(p.lng)}&radius=1200`, { cache: 'no-store' });
+            if (r.ok) {
+                const detail = await r.json();
+                const fresh = {
+                    id: p.id,
+                    name: (window.areaNameCache && areaNameCache.get(p.id)) || p.name,
+                    lat: p.lat,
+                    lng: p.lng,
+                    capacity: Number(detail.total_bays ?? p.capacity ?? 0),
+                    available_spots: Number(detail.available_bays ?? p.available_spots ?? 0),
+                    updated_at: detail.updated_at || p.updated_at
+                };
+                p = { ...p, ...fresh };
+            }
+        } catch (_) {}
+      }
 
     // 取历史（如果拿不到就用默认曲线）
-    const hist = await fetchAreaHistorySeries(p.id, p.lat, p.lng, 1200);
+    const hist = FRONTEND_FORECAST_ONLY ? null : await fetchAreaHistorySeries(p.id, p.lat, p.lng, SEARCH_RADIUS_METERS);
 
-    // 生成/缓存前端朴素预测（24h），容量优先用当前 lot 的 capacity
+    // Always recompute forecast from current availability to avoid stale cached values
     const total = Number(p.capacity || 60);
-    let forecast = areaForecastCache.get(p.id);
-    if (!forecast) {
-      forecast = makeNaiveForecast({ total, hours: 24, historySeries: hist });
+    const capNowRaw = (p && typeof p.available_spots !== 'undefined') ? Number(p.available_spots) : NaN;
+    const capNow = Number.isFinite(capNowRaw) ? capNowRaw : 0;
+    // Compute day-of-week and CBD proximity for this point
+    const cbd = { lat: -37.8136, lng: 144.9631 };
+    const dx = (p.lat - cbd.lat), dy = (p.lng - cbd.lng);
+    // crude proximity score: 1.0 in CBD core, ~0.0 in far suburbs
+    const d2 = dx*dx + dy*dy;
+    const cbdProximity = Math.max(0, Math.min(1, 1 - (d2 / 0.01))); // 0.01 ≈ ~10km^2 box scale
+    const dow = (new Date()).getDay();
+
+    let forecast = makeNaiveForecast({
+      total,
+      hours: 24,
+      historySeries: hist,
+      capNow,
+      dow,
+      cbdProximity,
+      stepMinutes: 60,
+      params: { noiseRatio: 0.03, baseDecay: 0.07, lowAvailExtraDecay: 0.10, lowAvailThreshold: 0.30, minSlack: 1 }
+    });
+
+    // Optionally store the latest (already-capped) forecast for display reuse
+    if (areaForecastCache && typeof areaForecastCache.set === 'function') {
       areaForecastCache.set(p.id, forecast);
     }
 
-      const d = p && p.updated_at ? new Date(p.updated_at) : new Date();
-      const updatedText = isNaN(d) ? '' : d.toLocaleTimeString();
-      const baseHtml = `${p.name}<br/>Availability: <strong>${p.available_spots}/${p.capacity}</strong><br/><small>Updated: ${updatedText}</small>`;
+    // Optionally log popup opening
+    console.log('[popup-open]', p.name, 'avail', p.available_spots, '/', p.capacity);
+    // Debug log for capping
+    console.log('[forecast]', { id: p.id, name: p.name, capNow, total, first: forecast[0]?.expected_available });
+
+    const d = p && p.updated_at ? new Date(p.updated_at) : new Date();
+    const updatedText = isNaN(d) ? '' : d.toLocaleTimeString();
+    const baseHtml = `${p.name}<br/>Availability: <strong>${p.available_spots}/${p.capacity}</strong><br/><small>Updated: ${updatedText}</small>`;
     const fHtml = forecastListHtml(forecast);
 
     L.popup()
@@ -630,6 +767,10 @@ function subscribeRealtime() {
           badge.classList.toggle('red', u.available_spots === 0);
         }
       });
+      // Invalidate per-area forecast when live availability changes
+      if (areaForecastCache && typeof areaForecastCache.delete === 'function') areaForecastCache.delete(u.id);
+      // If the popup for this marker is currently open, close it so the next click rebuilds with fresh data
+      if (map && map.closePopup) map.closePopup();
     }
   }, 2500 + Math.random() * 2000);
 }
@@ -672,7 +813,16 @@ let avgOccChart, busyHoursChart;
 async function renderCharts(lots) {
   const ctx1 = document.getElementById('avgOccChart');
   const ctx2 = document.getElementById('busyHoursChart');
-
+  if (!(ctx1 instanceof HTMLCanvasElement) || !(ctx2 instanceof HTMLCanvasElement)) {
+    console.warn('Charts: canvas elements not found; skipping render.');
+    return;
+  }
+    const g1 = ctx1.getContext && ctx1.getContext('2d');
+    const g2 = ctx2.getContext && ctx2.getContext('2d');
+    if (!g1 || !g2) {
+        console.warn('Charts: 2D context not available; skipping render.');
+        return;
+    }
   // If using real backend, try to fetch stats from /stats/parking
   if (!USE_MOCK) {
     try {
@@ -746,9 +896,9 @@ Object.assign(api, {
     try {
       const r = await fetch(url, { cache: 'no-store' });
       if (!r.ok) {
-        console.warn('areasNear failed:', r.status, r.statusText);
-        renderCharts ;     return { items: [] };
-      }
+            console.warn('areasNear failed:', r.status, r.statusText);
+            return { items: [] };
+        }
       let arr = [];
       try { arr = await r.json(); } catch (parseErr) { console.warn('areasNear JSON parse failed:', parseErr); }
       return { items: Array.isArray(arr) ? arr : [] };
@@ -763,15 +913,41 @@ Object.assign(api, {
     return r.json();
   },
 
-  async geoSearch(q) {
-    if (USE_MOCK) return mock.geoSearch(q);
-    // If no real geo endpoint yet, fall back to mock suggestions (non-blocking)
-    try {
-      const r = await fetch(`${API_BASE}/geo/search?q=${encodeURIComponent(q)}`);
-      if (r.ok) return r.json();
-    } catch (_) {}
-    return mock.geoSearch(q);
-  },
+    async geoSearch(q) {
+        // 非空校验
+        if (!q || (q = String(q).trim()).length < 2) return { items: [] };
+
+        // mock 模式仍走 mock，方便离线演示
+        if (USE_MOCK) return mock.geoSearch(q);
+
+        try {
+            // Greater Melbourne 的范围（lon,lat,lon,lat）
+            const viewbox = '144.40,-37.30,145.70,-38.60';
+            const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&dedupe=1&countrycodes=au&viewbox=${viewbox}&bounded=1&limit=8&q=${encodeURIComponent(q)}`;
+
+            const r = await fetch(url, {
+                headers: {
+                    'Accept': 'application/json',
+                    'Accept-Language': 'en',
+                    'User-Agent': 'FIT-5120-melb-parking/1.0 (contact: your-email@example.com)'
+                }
+            });
+            if (!r.ok) throw new Error(`Nominatim ${r.status}`);
+
+            const arr = await r.json();
+            const items = (Array.isArray(arr) ? arr : []).map(a => ({
+                place_id: a.place_id || `${a.lat},${a.lon}`,
+                name: a.display_name,
+                lat: Number(a.lat),
+                lng: Number(a.lon)
+            }));
+
+            return { items };
+        } catch (e) {
+            console.warn('geoSearch fallback to mock due to error:', e);
+            return mock.geoSearch(q);
+        }
+    },
   async parkingNear(lat, lng, radius) {
     // Real backend doesn't support lat/lng in this iteration; only use mock for this path
     if (USE_MOCK) return mock.parkingNear(lat, lng, radius);
@@ -896,7 +1072,7 @@ function populateSelect(selectEl, values, { selected } = {}) {
 
 async function drawCarOwnership({ labels, values }) {
     const ctx = document.getElementById('carOwnershipChart');
-    if (!ctx) return;
+    if (!(ctx instanceof HTMLCanvasElement)) { console.warn('CarOwnership chart canvas missing; skip.'); return; }
     if (carOwnershipChartRef) carOwnershipChartRef.destroy();
     carOwnershipChartRef = new Chart(ctx, {
         type: 'bar',
@@ -906,8 +1082,11 @@ async function drawCarOwnership({ labels, values }) {
 }
 
 async function drawCbdPopulation({ years, pops }) {
+    const g = ctx.getContext && ctx.getContext('2d');
+    if (!g) { console.warn('CarOwnership chart: 2D context not available; skip.'); return; }
+
     const ctx = document.getElementById('cbdPopulationChart');
-    if (!ctx) return;
+    if (!(ctx instanceof HTMLCanvasElement)) { console.warn('CBD Population chart canvas missing; skip.'); return; }
     if (cbdPopulationChartRef) cbdPopulationChartRef.destroy();
     cbdPopulationChartRef = new Chart(ctx, {
         type: 'line',
@@ -996,73 +1175,19 @@ function distanceMeters(a,b){ const R=6371000, toRad=d=>d*Math.PI/180, dLat=toRa
 // ---- Auto-load initial car parks (no manual search needed) ----
 let __initialLoaded = false;
 async function loadInitialCarParks() {
-  if (__initialLoaded) return;
-  __initialLoaded = true;
+  // Disabled: do not auto-load any parking on first open.
+  // Keep UI clean until user performs a search.
   try {
-    let items = [];
-    if (!USE_MOCK) {
-      const { items: areas } = await api.areasNear(MAP_DEFAULT.lat, MAP_DEFAULT.lng, 1200, 9, 12, 'mix');
-
-      // 转成伪 lots，重用现有 UI
-      const center = { lat: MAP_DEFAULT.lat, lng: MAP_DEFAULT.lng };
-      const pseudoLots = areas.map((a, i) => ({
-        id: a.area_id,
-        name: `Parking Area ${i+1}`,
-        lat: a.center.lat,
-        lng: a.center.lng,
-        capacity: a.total_bays,
-        available_spots: a.available_bays,
-        distance_m: distanceMeters(center, { lat: a.center.lat, lng: a.center.lng }),
-        updated_at: a.updated_at
-      }));
-
-      // 清理并渲染 markers + 侧栏
-      markers.clear(); cluster.clearLayers();
-      areaPolygons.clear(); areasLayer.clearLayers();
-      lotListEl.innerHTML = '';
-      pseudoLots.forEach(p => { upsertMarker(p); lotListEl.appendChild(lotCard(p)); });
-
-      // 视野
-      if (cluster.getLayers().length) {
-        map.fitBounds(cluster.getBounds(), { padding: [20,20] });
-      }
-
-      // 状态 + 图表 + 环保建议（与截图语义一致）
-      if (typeof statusEl !== 'undefined' && statusEl) {
-        statusEl.textContent = pseudoLots.length
-          ? `Showing ${pseudoLots.length} car parks (initial load).`
-          : 'No car parks available yet.';
-      }
-      renderCharts(pseudoLots);
-      if (typeof renderEnvSuggestions === 'function') {
-        const pseudoPlace = { name: 'Melbourne CBD', lat: MAP_DEFAULT.lat, lng: MAP_DEFAULT.lng };
-        renderEnvSuggestions(pseudoPlace, pseudoLots);
-      }
-      window.__lastParkingItems = pseudoLots.slice();
-      await nameAreas(pseudoLots); // assign realistic names on initial load
-      console.log('Initial parking areas (as car parks) loaded:', pseudoLots.length);
-      return;
-    }
-
-    // Mock 路径：保留旧逻辑
-    const { items: list } = await api.parkingNear(MAP_DEFAULT.lat, MAP_DEFAULT.lng, 1200);
-    items = list || [];
-    const center = { lat: MAP_DEFAULT.lat, lng: MAP_DEFAULT.lng };
-    for (const it of items) it.distance_m = distanceMeters(center, it);
-    window.__lastParkingItems = items.slice();
-    markers.clear(); cluster.clearLayers(); lotListEl.innerHTML = '';
-    items.forEach((p) => { upsertMarker(p); lotListEl.appendChild(lotCard(p)); });
-    if (items.length && cluster.getLayers().length) { map.fitBounds(cluster.getBounds(), { padding: [20, 20] }); }
-    if (typeof statusEl !== 'undefined' && statusEl) { statusEl.textContent = items.length ? `Showing ${items.length} car parks (initial load).` : 'No car parks available yet.'; }
-    renderCharts(items);
-    if (typeof renderEnvSuggestions === 'function') {
-      const pseudoPlace = { name: 'Melbourne CBD', lat: MAP_DEFAULT.lat, lng: MAP_DEFAULT.lng };
-      renderEnvSuggestions(pseudoPlace, items);
-    }
-    console.log('Initial car parks loaded:', items.length);
-  } catch (err) {
-    console.error('loadInitialCarParks failed:', err);
-  }
+    if (suggestionsEl) suggestionsEl.style.display = 'none';
+    if (lotListEl) lotListEl.innerHTML = '';
+    if (statusEl) statusEl.textContent = 'Search a place to see nearby car parks (500 m radius).';
+    if (cluster) cluster.clearLayers();
+    if (areasLayer) areasLayer.clearLayers();
+    if (markers) markers.clear();
+    window.__lastParkingItems = [];
+    window.__lastAreas = [];
+  } catch (_) {}
+  return;
 }
 function updateDistancesFrom(origin){
     const list = Array.isArray(window.__lastParkingItems) ? window.__lastParkingItems : [];
@@ -1079,10 +1204,24 @@ function updateDistancesFrom(origin){
     }
 }
 // Run after DOM is ready
+// ---- Auto-load initial car parks (no manual search needed) ----
+// ---- Auto-load initial car parks (no manual search needed) ----
 (function autoLoadBootstrap(){
     function boot(){
-        setTimeout(loadInitialCarParks, 300);
+        // Do NOT auto-load any car parks on first open.
+        // Only initialize the Insights charts; parking appears after a search.
         setTimeout(initInsights, 350);
+        // Prepare a clean UI: no markers/cards until user searches
+        try {
+            if (suggestionsEl) suggestionsEl.style.display = 'none';
+            if (lotListEl) lotListEl.innerHTML = '';
+            if (statusEl) statusEl.textContent = 'Search a place to see nearby car parks (500 m radius).';
+            if (cluster) cluster.clearLayers();
+            if (areasLayer) areasLayer.clearLayers();
+            if (markers) markers.clear();
+            window.__lastParkingItems = [];
+            window.__lastAreas = [];
+        } catch (_) {}
     }
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         boot();
