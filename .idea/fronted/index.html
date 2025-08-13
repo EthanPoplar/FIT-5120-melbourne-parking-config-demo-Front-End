@@ -200,27 +200,14 @@
     <section id="insights" class="panel" style="margin-top:16px;">
       <h3 style="margin-bottom:6px">Melbourne Insights</h3>
 
-      <div id="carOwnershipCard" class="card" style="margin:12px 0;">
-        <h4>Car ownership by region</h4>
-        <div class="controls" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0;">
-          <label>Year
-            <select id="carYear"></select>
-          </label>
-          <label>Region
-            <select id="carRegion"></select>
-          </label>
-        </div>
-        <canvas id="carOwnershipChart" height="200"></canvas>
+      <div id="avgOccCard" class="card" style="margin:12px 0;">
+        <h4>Average occupancy by car park</h4>
+        <canvas id="avgOccupancyChart" height="200"></canvas>
       </div>
 
-      <div id="cbdPopulationCard" class="card" style="margin:12px 0;">
-        <h4>CBD population</h4>
-        <div class="controls" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0;">
-          <label>Year
-            <select id="cbdYear"></select>
-          </label>
-        </div>
-        <canvas id="cbdPopulationChart" height="200"></canvas>
+      <div id="busiestHoursCard" class="card" style="margin:12px 0;">
+        <h4>Busiest hours (today)</h4>
+        <canvas id="busiestHoursChart" height="200"></canvas>
       </div>
     </section>
   </main>

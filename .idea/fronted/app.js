@@ -961,184 +961,81 @@ Object.assign(api, {
   __mockPushUpdates(ids) { return mock.pushUpdates(ids); }
 });
 // ===================== Melbourne Insights =====================
-let carOwnershipChartRef, cbdPopulationChartRef;
-
-function yearsFrom(minYear = 2011, maxYear = new Date().getFullYear()) {
-    const out = [];
-    for (let y = minYear; y <= maxYear; y++) out.push(y);
-    return out;
-}
+let avgOccChartRef, busiestHoursChartRef;
 
 const mockInsights = {
-    regions() {
-        return ['Melbourne', 'Port Phillip', 'Stonnington', 'Yarra', 'Docklands', 'Southbank'];
-    },
-    async carOwnership(year, region) {
-        // 假数据（可稳定），便于没有后端时也能用
-        const base = [1.22, 1.35, 1.28, 1.10, 0.88, 0.95];
-        const labels = this.regions();
-        const jitter = (i) => (Math.sin((year + i) * 0.7) * 0.05);
-        const values = labels.map((_, i) => Math.max(0.6, +(base[i] + jitter(i)).toFixed(2)));
-        if (region && region !== 'ALL') {
-            const idx = Math.max(0, labels.indexOf(region));
-            return { labels: [labels[idx]], values: [values[idx]] };
-        }
+    async averageOccupancy() {
+        const lots = [
+            { name: 'Flinders Lane Car Park', capacity: 220, available: 88 },
+            { name: 'Russell St Car Park',    capacity: 160, available: 47 },
+            { name: 'QV Car Park',            capacity: 120, available: 12 },
+            { name: 'Derby Rd Car Park',      capacity: 180, available: 61 },
+            { name: 'Caulfield Plaza Car Park', capacity: 140, available: 9 }
+        ];
+        const labels = lots.map(l => l.name);
+        const values = lots.map(l => Math.round((1 - l.available / l.capacity) * 100));
         return { labels, values };
     },
-    async cbdPopulation(year) {
-        // 生成从 2011 到所选年份的时间序列
-        const start = 2011;
-        const end = Math.max(start, Math.min(year, new Date().getFullYear()));
-        const years = [];
-        const pops = [];
-        let p = 35000; // 起点
-        for (let y = start; y <= end; y++) {
-            p = Math.round(p * (1 + (y % 7 === 0 ? 0.025 : 0.018)));
-            if (y === 2020 || y === 2021) p = Math.round(p * 0.96); // 疫情年下探
-            years.push(y);
-            pops.push(p);
-        }
-        return { years, pops };
+    async busiestHoursToday() {
+        const hours = Array.from({ length: 24 }, (_, i) => `${i}:00`);
+        const counts = hours.map((_, i) => {
+            const value = Math.round(80 - Math.pow(i - 13, 2) * 3);
+            return Math.max(5, value);
+        });
+        return { hours, counts };
     }
 };
 
 if (!api.insights) api.insights = {};
-api.insights.regions = async function() {
-    if (USE_MOCK) return mockInsights.regions();
+api.insights.averageOccupancy = async function() {
+    if (USE_MOCK) return mockInsights.averageOccupancy();
     try {
-        const r = await fetch(`${API_BASE}/insights/regions`, { cache: 'no-store' });
+        const r = await fetch(`${API_BASE}/insights/average-occupancy`, { cache: 'no-store' });
         if (r.ok) return r.json();
     } catch(_) {}
-    return mockInsights.regions();
+    return mockInsights.averageOccupancy();
 };
-api.insights.carOwnership = async function(year, region) {
-    if (USE_MOCK) return mockInsights.carOwnership(year, region);
+api.insights.busiestHoursToday = async function() {
+    if (USE_MOCK) return mockInsights.busiestHoursToday();
     try {
-        const u = new URL(`${API_BASE}/insights/car-ownership`, location.origin);
-        u.searchParams.set('year', String(year));
-        if (region && region !== 'ALL') u.searchParams.set('region', region);
-        const r = await fetch(u.toString().replace(location.origin, ''), { cache: 'no-store' });
-        if (r.ok) {
-            const j = await r.json();
-            if (Array.isArray(j)) {
-                const labels = j.map(x => x.region || x.lga || x.name);
-                const values = j.map(x => Number(x.cars_per_household || x.ownership_rate || x.value || 0));
-                return { labels, values };
-            } else if (j && typeof j === 'object') {
-                const label = j.region || j.lga || j.name || (region || 'Selected');
-                const value = Number(j.cars_per_household || j.ownership_rate || j.value || 0);
-                return { labels: [label], values: [value] };
-            }
-        }
+        const r = await fetch(`${API_BASE}/insights/busiest-hours-today`, { cache: 'no-store' });
+        if (r.ok) return r.json();
     } catch(_) {}
-    return mockInsights.carOwnership(year, region);
-};
-api.insights.cbdPopulation = async function(year) {
-    if (USE_MOCK) return mockInsights.cbdPopulation(year);
-    try {
-        const u = new URL(`${API_BASE}/insights/cbd-population`, location.origin);
-        u.searchParams.set('year', String(year));
-        const r = await fetch(u.toString().replace(location.origin, ''), { cache: 'no-store' });
-        if (r.ok) {
-            const j = await r.json();
-            if (Array.isArray(j)) {
-                const years = j.map(x => Number(x.year));
-                const pops  = j.map(x => Number(x.population || x.value || 0));
-                return { years, pops };
-            } else if (j && typeof j === 'object') {
-                if (Array.isArray(j.series)) {
-                    const years = j.series.map(x => Number(x.year));
-                    const pops  = j.series.map(x => Number(x.population || x.value || 0));
-                    return { years, pops };
-                } else {
-                    return { years: [Number(j.year || year)], pops: [Number(j.population || j.value || 0)] };
-                }
-            }
-        }
-    } catch(_) {}
-    return mockInsights.cbdPopulation(year);
+    return mockInsights.busiestHoursToday();
 };
 
-function populateSelect(selectEl, values, { selected } = {}) {
-    selectEl.innerHTML = '';
-    for (const v of values) {
-        const opt = document.createElement('option');
-        opt.value = String(v);
-        opt.textContent = String(v);
-        if (selected != null && String(v) === String(selected)) opt.selected = true;
-        selectEl.appendChild(opt);
-    }
-}
-
-async function drawCarOwnership({ labels, values }) {
-    const ctx = document.getElementById('carOwnershipChart');
-    if (!(ctx instanceof HTMLCanvasElement)) { console.warn('CarOwnership chart canvas missing; skip.'); return; }
-    if (carOwnershipChartRef) carOwnershipChartRef.destroy();
-    carOwnershipChartRef = new Chart(ctx, {
+async function drawAverageOccupancy({ labels, values }) {
+    const ctx = document.getElementById('avgOccupancyChart');
+    if (!(ctx instanceof HTMLCanvasElement)) { console.warn('avgOccupancyChart canvas missing; skip.'); return; }
+    if (avgOccChartRef) avgOccChartRef.destroy();
+    avgOccChartRef = new Chart(ctx, {
         type: 'bar',
-        data: { labels, datasets: [{ label: 'Cars per household', data: values }] },
-        options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+        data: { labels, datasets: [{ label: 'Average occupancy (%)', data: values }] },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, max: 100 } } }
     });
 }
 
-async function drawCbdPopulation({ years, pops }) {
-    const g = ctx.getContext && ctx.getContext('2d');
-    if (!g) { console.warn('CarOwnership chart: 2D context not available; skip.'); return; }
-
-    const ctx = document.getElementById('cbdPopulationChart');
-    if (!(ctx instanceof HTMLCanvasElement)) { console.warn('CBD Population chart canvas missing; skip.'); return; }
-    if (cbdPopulationChartRef) cbdPopulationChartRef.destroy();
-    cbdPopulationChartRef = new Chart(ctx, {
+async function drawBusiestHours({ hours, counts }) {
+    const ctx = document.getElementById('busiestHoursChart');
+    if (!(ctx instanceof HTMLCanvasElement)) { console.warn('busiestHoursChart canvas missing; skip.'); return; }
+    if (busiestHoursChartRef) busiestHoursChartRef.destroy();
+    busiestHoursChartRef = new Chart(ctx, {
         type: 'line',
-        data: { labels: years, datasets: [{ label: 'CBD population', data: pops, tension: 0.35 }] },
-        options: { responsive: true, plugins: { legend: { display: false } } }
+        data: { labels: hours, datasets: [{ label: 'Cars parked', data: counts, tension: 0.35 }] },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 8 } } } }
     });
 }
 
 async function initInsights() {
-    const carYearSel = document.getElementById('carYear');
-    const carRegionSel = document.getElementById('carRegion');
-    const cbdYearSel = document.getElementById('cbdYear');
-    if (!carYearSel || !carRegionSel || !cbdYearSel) return; // HTML 不存在就跳过
+    const avgCtx = document.getElementById('avgOccupancyChart');
+    const busyCtx = document.getElementById('busiestHoursChart');
+    if (!avgCtx || !busyCtx) return;
 
-    const currentYear = new Date().getFullYear();
-    const defaultYear = currentYear - 1; // 默认上一个完整年
-    populateSelect(carYearSel, yearsFrom(2011, currentYear), { selected: defaultYear });
-    populateSelect(cbdYearSel, yearsFrom(2011, currentYear), { selected: defaultYear });
+    const avgData = await api.insights.averageOccupancy();
+    await drawAverageOccupancy(avgData);
 
-    try {
-        const regions = await api.insights.regions();
-        carRegionSel.innerHTML = '';
-        const allOpt = document.createElement('option');
-        allOpt.value = 'ALL'; allOpt.textContent = 'All regions';
-        carRegionSel.appendChild(allOpt);
-        for (const r of regions) {
-            const opt = document.createElement('option');
-            opt.value = r; opt.textContent = r;
-            carRegionSel.appendChild(opt);
-        }
-        carRegionSel.value = 'ALL';
-    } catch (_) { /* 使用 mock */ }
-
-    async function refreshCar() {
-        const year = Number(carYearSel.value);
-        const region = carRegionSel.value;
-        const data = await api.insights.carOwnership(year, region);
-        await drawCarOwnership(data);
-    }
-    async function refreshCBD() {
-        const year = Number(cbdYearSel.value);
-        const data = await api.insights.cbdPopulation(year);
-        await drawCbdPopulation(data);
-    }
-
-    carYearSel.addEventListener('change', refreshCar);
-    carRegionSel.addEventListener('change', refreshCar);
-    cbdYearSel.addEventListener('change', refreshCBD);
-
-    // 初次渲染
-    await refreshCar();
-    await refreshCBD();
+    const busyData = await api.insights.busiestHoursToday();
+    await drawBusiestHours(busyData);
 }
 
 
